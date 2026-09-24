@@ -134,7 +134,7 @@ jobs:
             for attempt in 1 2 3; do
               echo "=== supabase start attempt ${attempt}/3 ==="
               reset_supabase
-              if npx supabase start -x analytics,vector; then
+              if npx supabase start -x logflare,vector; then
                 echo 0 > "${RUN_TMP}/supabase-start.exitcode"
                 exit 0
               fi

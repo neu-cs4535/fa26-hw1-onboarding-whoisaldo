@@ -54,7 +54,7 @@ The existing grading screenshot test captures expanded and collapsed headers of 
 Run the same checks as CI:
 
 ```sh
-npx supabase start -x analytics,vector
+npx supabase start -x logflare,vector
 npx supabase db reset
 npm run client-local
 npm run seed -- --template cs4535
