@@ -1,5 +1,6 @@
 "use client";
 
+import ColumnGroupsDialog from "./columnGroupsDialog";
 import { TimeZoneAwareDate } from "@/components/TimeZoneAwareDate";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
@@ -247,7 +248,7 @@ function buildVisibleReorderUnits(args: {
       units.push([colId]);
       continue;
     }
-    const collapsed = collapsedGroups.has(group.groupName);
+    const collapsed = collapsedGroups.has(`group-${col?.group_id}`);
     if (collapsed) {
       const best = findBestColumnToShow(group.columns);
       if (colId !== best.id) continue;
@@ -1716,12 +1717,20 @@ function GradebookColumnHeader({
     isMovingRef.current = true;
     setIsMovingLeft(true);
     try {
-      const { error } = await supabase.rpc("gradebook_column_move_left", {
-        p_column_id: column_id
-      });
+      const ordered = [...gradebookController.gradebook_columns.rows].sort(
+        (a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.id - b.id
+      );
+      const members = ordered.filter((c) => c.group_id === column.group_id);
+      const neighbor = members[members.findIndex((c) => c.id === column_id) - 1];
+      if (!neighbor) return;
+      const ids = ordered.map((c) => c.id);
+      const index = ids.indexOf(column_id);
+      const other = ids.indexOf(neighbor.id);
+      [ids[index], ids[other]] = [ids[other], ids[index]];
+      const { error } = await supabase.rpc("gradebook_columns_reorder", { p_ordered_column_ids: ids });
 
       if (error) throw error;
-      await gradebookController.gradebook_columns.refetchByIds([column_id]);
+      await gradebookController.gradebook_columns.refetchAll();
 
       toaster.create({
         title: "Column moved left",
@@ -1746,13 +1755,21 @@ function GradebookColumnHeader({
     isMovingRef.current = true;
     setIsMovingRight(true);
     try {
-      const { error } = await supabase.rpc("gradebook_column_move_right", {
-        p_column_id: column_id
-      });
+      const ordered = [...gradebookController.gradebook_columns.rows].sort(
+        (a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0) || a.id - b.id
+      );
+      const members = ordered.filter((c) => c.group_id === column.group_id);
+      const neighbor = members[members.findIndex((c) => c.id === column_id) + 1];
+      if (!neighbor) return;
+      const ids = ordered.map((c) => c.id);
+      const index = ids.indexOf(column_id);
+      const other = ids.indexOf(neighbor.id);
+      [ids[index], ids[other]] = [ids[other], ids[index]];
+      const { error } = await supabase.rpc("gradebook_columns_reorder", { p_ordered_column_ids: ids });
 
       if (error) throw error;
 
-      await gradebookController.gradebook_columns.refetchByIds([column_id]);
+      await gradebookController.gradebook_columns.refetchAll();
 
       toaster.create({
         title: "Column moved right",
@@ -2478,8 +2495,9 @@ export default function GradebookTable() {
   const isRefetching = useGradebookRefetchStatus();
   const isGradebookDataReady = useIsGradebookDataReady();
 
-  // State for collapsible groups - use base group name as key for stability
+  // Persist collapse state by group identity, independent of editable labels.
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
+  const knownGroupKeys = useRef(new Set<string>());
   const [isAutoLayouting, setIsAutoLayouting] = useState(false);
   const [exportWithRenderExpressions, setExportWithRenderExpressions] = useState(false);
   const [activeDragColumnId, setActiveDragColumnId] = useState<string | null>(null);
@@ -2544,6 +2562,9 @@ export default function GradebookTable() {
   const cachedColumnsKey = JSON.stringify(columnsForGrouping);
   const groupedColumns = useMemo(() => {
     const groups: Record<string, { groupName: string; columns: typeof columnsForGrouping }> = {};
+    for (const group of [...columnGroups].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id)) {
+      groups[`group-${group.id}`] = { groupName: group.name, columns: [] };
+    }
     const names = new Map(columnGroups.map((group) => [group.id, group.name]));
     const columns = JSON.parse(cachedColumnsKey) as typeof columnsForGrouping;
     for (const col of columns) {
@@ -2553,30 +2574,16 @@ export default function GradebookTable() {
       groups[key] ??= { groupName: name ?? col.name, columns: [] };
       groups[key].columns.push(col);
     }
-    return groups;
+    return Object.fromEntries(Object.entries(groups).filter(([, group]) => group.columns.length > 0));
   }, [cachedColumnsKey, columnGroups]);
 
   // Initialize all groups as collapsed by default, but preserve existing collapsed state
   useEffect(() => {
     const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
-    const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
-    setCollapsedGroups((prev) => {
-      const newSet = new Set<string>();
-
-      // Preserve existing collapsed state for groups that still exist
-      baseGroupNames.forEach((baseGroupName) => {
-        if (prev.has(baseGroupName)) {
-          newSet.add(baseGroupName);
-        }
-      });
-
-      // If no groups were previously collapsed, collapse all by default
-      if (newSet.size === 0 && baseGroupNames.length > 0) {
-        baseGroupNames.forEach((baseGroupName) => newSet.add(baseGroupName));
-      }
-
-      return newSet;
-    });
+    const baseGroupNames = allGroupKeys;
+    const previousKeys = knownGroupKeys.current;
+    setCollapsedGroups((prev) => new Set(baseGroupNames.filter((key) => prev.has(key) || !previousKeys.has(key))));
+    knownGroupKeys.current = new Set(baseGroupNames);
   }, [groupedColumns]);
 
   // Force recalculation helper
@@ -2612,7 +2619,7 @@ export default function GradebookTable() {
     }, 50);
   }, [students]);
 
-  // Toggle group collapse/expand using base group name
+  // Toggle group collapse/expand by persisted identity.
   const toggleGroup = useCallback(
     (baseGroupName: string) => {
       setCollapsedGroups((prev) => {
@@ -2699,7 +2706,7 @@ export default function GradebookTable() {
   // Collapse all groups
   const collapseAll = useCallback(() => {
     const allGroupKeys = Object.keys(groupedColumns).filter((key) => groupedColumns[key].columns.length > 1);
-    const baseGroupNames = [...new Set(allGroupKeys.map((key) => groupedColumns[key].groupName))];
+    const baseGroupNames = allGroupKeys;
     setCollapsedGroups(new Set(baseGroupNames));
     forceRecalculation();
   }, [groupedColumns, forceRecalculation]);
@@ -2738,9 +2745,8 @@ export default function GradebookTable() {
   /**
    * Build columns with header groups
    *
-   * Header groups are created from gradebook columns that share the same slug prefix
-   * (everything before the first hyphen). Groups are only created when multiple
-   * contiguous columns share the same prefix.
+   * Header groups use persisted membership and group order. Member order comes
+   * from column sort_order; unassigned columns remain independent.
    *
    * Header Group Behavior:
    * - When EXPANDED: The group header spans all child columns using colSpan,
@@ -2856,8 +2862,8 @@ export default function GradebookTable() {
           enableSorting: true
         });
       } else {
-        // Multiple columns - handle collapsed state using base group name
-        const isCollapsed = collapsedGroups.has(group.groupName);
+        // Multiple columns share collapse state by group ID.
+        const isCollapsed = collapsedGroups.has(groupKey);
         const columnsToShow = isCollapsed ? [findBestColumnToShow(group.columns)] : group.columns;
 
         columnsToShow.forEach((col) => {
@@ -3015,19 +3021,41 @@ export default function GradebookTable() {
       if (!activeIdStr.startsWith("grade_")) return;
       const draggedColumnId = Number(activeIdStr.slice(6));
 
+      const dragged = gradebookColumns.find((c) => c.id === draggedColumnId);
+      if (!dragged) return;
+      const groupIds = [...columnGroups].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id).map((g) => g.id);
+      const targetUnit = visibleReorderUnits[gapIndex] ?? visibleReorderUnits.at(-1);
+      const target = gradebookColumns.find((c) => c.id === targetUnit?.[0]);
+      const movingGroup = dragged.group_id !== null && collapsedGroups.has(`group-${dragged.group_id}`);
+      if (movingGroup && target?.group_id === dragged.group_id) return;
+      if (!movingGroup && target && target.group_id !== dragged.group_id) {
+        toaster.create({ title: "Use Manage groups to change a column's group", type: "info" });
+        return;
+      }
       const merged = insertColumnAtGap(fullGradeColumnIdsOrdered, draggedColumnId, visibleReorderUnits, gapIndex);
-      const unchanged =
-        merged.length === fullGradeColumnIdsOrdered.length &&
-        merged.every((id, i) => id === fullGradeColumnIdsOrdered[i]);
-      if (unchanged) return;
-
       setIsReorderingColumns(true);
       try {
-        const { error } = await supabaseForGradebook.rpc("gradebook_columns_reorder", {
-          p_ordered_column_ids: merged
-        });
-        if (error) throw error;
-        await gradebookController.gradebook_columns.refetchAll();
+        if (movingGroup) {
+          const orderedGroups = groupIds.filter((id) => id !== dragged.group_id);
+          const targetIndex = target?.group_id == null ? -1 : orderedGroups.indexOf(target.group_id);
+          orderedGroups.splice(
+            targetIndex < 0 || gapIndex === visibleReorderUnits.length ? orderedGroups.length : targetIndex,
+            0,
+            dragged.group_id!
+          );
+          const { error } = await supabaseForGradebook.rpc("gradebook_column_groups_reorder", {
+            p_gradebook_id: gradebookController.gradebook_id,
+            p_group_ids: orderedGroups
+          });
+          if (error) throw error;
+          await gradebookController.gradebook_column_groups.refetchAll();
+        } else {
+          const { error } = await supabaseForGradebook.rpc("gradebook_columns_reorder", {
+            p_ordered_column_ids: merged
+          });
+          if (error) throw error;
+          await gradebookController.gradebook_columns.refetchAll();
+        }
         toaster.create({
           title: "Columns reordered",
           type: "success"
@@ -3042,7 +3070,16 @@ export default function GradebookTable() {
         setIsReorderingColumns(false);
       }
     },
-    [isInstructor, visibleReorderUnits, fullGradeColumnIdsOrdered, supabaseForGradebook, gradebookController]
+    [
+      isInstructor,
+      visibleReorderUnits,
+      fullGradeColumnIdsOrdered,
+      supabaseForGradebook,
+      gradebookController,
+      gradebookColumns,
+      columnGroups,
+      collapsedGroups
+    ]
   );
 
   const dragOverlayColumn = useMemo(() => {
@@ -3193,6 +3230,7 @@ export default function GradebookTable() {
       width: number;
       key: string;
       groupName: string;
+      groupKey: string;
       isCollapsed: boolean;
       groupColumnsLen: number;
     };
@@ -3216,7 +3254,7 @@ export default function GradebookTable() {
       }
       const groupColumns = group.columns;
       const isFirstInGroup = groupColumns[0].id === columnId;
-      const isCollapsed = collapsedGroups.has(group.groupName);
+      const isCollapsed = collapsedGroups.has(`group-${column.group_id}`);
       const bestCol = findBestColumnToShow(groupColumns);
       const isVisibleWhenCollapsed = isCollapsed && columnId === bestCol.id;
 
@@ -3231,6 +3269,7 @@ export default function GradebookTable() {
           width,
           key: `grp-${group.groupName}-${columnId}`,
           groupName: group.groupName,
+          groupKey: `group-${column.group_id}`,
           isCollapsed,
           groupColumnsLen: groupColumns.length
         });
@@ -3254,7 +3293,7 @@ export default function GradebookTable() {
         if (column) {
           const group = column.group_id === null ? undefined : groupedColumns[`group-${column.group_id}`];
           if (group && group.columns.length > 1) {
-            const isCollapsed = collapsedGroups.has(group.groupName);
+            const isCollapsed = collapsedGroups.has(`group-${column.group_id}`);
             if (isCollapsed) {
               const bestColumn = findBestColumnToShow(group.columns);
               return columnId === bestColumn.id;
@@ -3289,7 +3328,7 @@ export default function GradebookTable() {
                 left={0}
                 top={0}
                 bottom={0}
-                onClick={() => toggleGroup((cell.column.columnDef.meta as { groupName?: string })?.groupName || "")}
+                onClick={() => toggleGroup((cell.column.columnDef.meta as { groupKey?: string })?.groupKey || "")}
                 aria-label="Expand group"
                 colorPalette="blue"
                 opacity={0.8}
@@ -3646,7 +3685,7 @@ export default function GradebookTable() {
                           minH="36px"
                           bg={seg.isCollapsed ? "bg.warning" : "bg.emphasized"}
                           cursor="pointer"
-                          onClick={() => toggleGroup(seg.groupName)}
+                          onClick={() => toggleGroup(seg.groupKey)}
                           _hover={{ bg: "bg.info" }}
                           borderBottom="1px solid"
                           borderColor="border.emphasized"
@@ -3656,7 +3695,7 @@ export default function GradebookTable() {
                         >
                           <HStack gap={2} justifyContent="center" alignItems="center" py={1}>
                             <Icon
-                              as={collapsedGroups.has(seg.groupName) ? LuChevronRight : LuChevronDown}
+                              as={collapsedGroups.has(seg.groupKey) ? LuChevronRight : LuChevronDown}
                               boxSize={3}
                               color="fg.muted"
                             />
@@ -3907,6 +3946,7 @@ export default function GradebookTable() {
               </PopoverContent>
             </PopoverRoot>
             <ImportGradebookColumn />
+            <ColumnGroupsDialog />
             <AddColumnDialog />
           </HStack>
         )}

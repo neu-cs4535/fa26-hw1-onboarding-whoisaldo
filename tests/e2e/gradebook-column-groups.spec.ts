@@ -188,7 +188,7 @@ test.describe("gradebook column groups", () => {
   });
 });
 
-test("persisted groups preserve legacy boundaries and enforce course permissions", async ({ page }) => {
+test("groups fix backfill families and enforce course permissions", async ({ page }) => {
   test.setTimeout(180_000);
   await page.setViewportSize({ width: 2560, height: 1440 });
   const course = await createClass();
@@ -207,7 +207,7 @@ test("persisted groups preserve legacy boundaries and enforce course permissions
   const book = books!.find((b) => b.class_id === course.id)!;
   const otherBook = books!.find((b) => b.class_id === otherCourse.id)!;
   // Includes a sort-order gap, a repeated prefix, a two-part assignment slug,
-  // and a blank assignment subtype. These are explicit legacy expectations.
+  // a compound family name and a blank assignment subtype.
   const layout = [
     ["quiz-1", 0],
     ["quiz-2", 1],
@@ -217,7 +217,9 @@ test("persisted groups preserve legacy boundaries and enforce course permissions
     ["assignment-lab-2", 6],
     ["assignment-final", 7],
     ["quiz-6", 8],
-    ["assignment--1", 9]
+    ["assignment--1", 9],
+    ["ai-usage-log-1", 10],
+    ["ai-usage-log-2", 11]
   ] as const;
   for (const [slug, sort_order] of layout) {
     const { error } = await supabase.from("gradebook_columns").insert({
@@ -257,13 +259,17 @@ test("persisted groups preserve legacy boundaries and enforce course permissions
     "Quiz",
     "Lab",
     "Lab",
-    "Assignment",
+    "Final",
     "Quiz",
-    ""
+    "assignment--1",
+    "AI Usage Log",
+    "AI Usage Log"
   ]);
   expect(columns![0].group_id).toBe(columns![1].group_id);
   expect(columns![2].group_id).toBe(columns![3].group_id);
-  expect(new Set(columns!.map((c) => c.group_id)).size).toBe(6);
+  expect(columns![0].group_id).toBe(columns![2].group_id);
+  expect(columns![0].group_id).toBe(columns![7].group_id);
+  expect(new Set(columns!.map((c) => c.group_id)).size).toBe(5);
   const groupId = columns![0].group_id!;
   const { data: foreignGroups } = await supabase
     .from("gradebook_column_groups")
@@ -283,7 +289,7 @@ test("persisted groups preserve legacy boundaries and enforce course permissions
       .select("id")
       .eq("gradebook_id", book.id);
     expect(readError).toBeNull();
-    expect(data).toHaveLength(6);
+    expect(data).toHaveLength(5);
     expect(
       (await client.rpc("initialize_gradebook_column_groups", { target_gradebook_id: book.id })).error
     ).not.toBeNull();
@@ -304,6 +310,45 @@ test("persisted groups preserve legacy boundaries and enforce course permissions
     ).toEqual([]);
     expect((await client.from("gradebook_column_groups").delete().eq("id", groupId).select("id")).data).toEqual([]);
   }
+  const currentIds = [...new Set(columns!.map((c) => c.group_id!))];
+  for (const client of [staff, learner, stranger, anonymous]) {
+    expect(
+      (await client.rpc("gradebook_column_groups_reorder", { p_gradebook_id: book.id, p_group_ids: currentIds })).error
+    ).not.toBeNull();
+    const before = columns![0].group_id;
+    await client.from("gradebook_columns").update({ group_id: null }).eq("id", columns![0].id);
+    expect(
+      (await teacher.from("gradebook_columns").select("group_id").eq("id", columns![0].id).single()).data?.group_id
+    ).toBe(before);
+  }
+  for (const invalid of [
+    currentIds.slice(1),
+    [...currentIds, currentIds[0]],
+    [...currentIds.slice(1), foreignGroupId]
+  ]) {
+    expect(
+      (await teacher.rpc("gradebook_column_groups_reorder", { p_gradebook_id: book.id, p_group_ids: invalid })).error
+    ).not.toBeNull();
+  }
+  const membership = columns!.map(({ id, group_id }) => ({ id, group_id })).sort((a, b) => a.id - b.id);
+  expect(
+    (
+      await teacher.rpc("gradebook_column_groups_reorder", {
+        p_gradebook_id: book.id,
+        p_group_ids: [...currentIds].reverse()
+      })
+    ).error
+  ).toBeNull();
+  expect(
+    (await teacher.from("gradebook_columns").select("id,group_id").eq("gradebook_id", book.id).order("id")).data
+  ).toEqual(membership);
+  expect(
+    (await teacher.rpc("gradebook_columns_reorder", { p_ordered_column_ids: columns!.map((c) => c.id).reverse() }))
+      .error
+  ).toBeNull();
+  expect(
+    (await teacher.from("gradebook_columns").select("id,group_id").eq("gradebook_id", book.id).order("id")).data
+  ).toEqual(membership);
   const { data: hiddenGroup, error: createError } = await teacher
     .from("gradebook_column_groups")
     .insert({
@@ -372,7 +417,74 @@ test("persisted groups preserve legacy boundaries and enforce course permissions
   await page.goto(`/course/${course.id}/manage/gradebook`);
   await expect(page.getByRole("button", { name: "Expand all groups" })).toBeVisible();
   await page.getByRole("button", { name: "Collapse all groups" }).click();
-  await expect(page.getByText("2 Persisted topics...", { exact: true })).toBeVisible();
+  await expect(page.getByText("5 Persisted topics...", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Expand all groups" }).click();
+  await expect(page.getByRole("columnheader", { name: /New standalone column/ })).toBeVisible();
+  await page.getByRole("button", { name: "Manage groups", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Manage column groups" });
+  await dialog.getByRole("textbox", { name: "Group name", exact: true }).fill("Coursework");
+  await dialog.getByRole("button", { name: "Create group", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Rename group", exact: true })).toBeEnabled();
+  const picker = dialog.getByRole("combobox", { name: "Selected group", exact: true });
+  const createdId = Number(await picker.inputValue());
+  const assignment = dialog.getByRole("combobox", { name: "Group for New standalone column", exact: true });
+  await assignment.selectOption(String(createdId));
+  await expect(assignment).toBeEnabled();
+  await dialog.getByRole("combobox", { name: "Group for Renamed quiz", exact: true }).selectOption(String(createdId));
+  await expect(assignment).toBeEnabled();
+  await dialog.getByRole("textbox", { name: "Group name", exact: true }).fill("Portfolio");
+  await dialog.getByRole("button", { name: "Rename group", exact: true }).click();
+  await expect(picker.locator("option:checked")).toHaveText("Portfolio");
+  await expect(dialog.getByRole("button", { name: "Move group up", exact: true })).toBeEnabled();
+  await visualScreenshot(page, "column-groups-management");
+  const scoresBeforeDelete = (
+    await teacher
+      .from("gradebook_column_students")
+      .select("id,gradebook_column_id,score,score_override")
+      .eq("class_id", course.id)
+      .order("id")
+  ).data;
+  const beforeMove = (
+    await teacher.from("gradebook_columns").select("id,group_id").eq("gradebook_id", book.id).order("id")
+  ).data;
+  const beforeOrder = await picker
+    .locator("option")
+    .evaluateAll((options) => options.map((o) => (o as HTMLOptionElement).value));
+  await dialog.getByRole("button", { name: "Move group up", exact: true }).click();
+  await expect
+    .poll(() => picker.locator("option").evaluateAll((options) => options.map((o) => (o as HTMLOptionElement).value)))
+    .not.toEqual(beforeOrder);
+  await expect(dialog.getByRole("button", { name: "Move group down", exact: true })).toBeEnabled();
+  expect(
+    (await teacher.from("gradebook_columns").select("id,group_id").eq("gradebook_id", book.id).order("id")).data
+  ).toEqual(beforeMove);
+  await dialog.getByRole("button", { name: "Done", exact: true }).click();
+  await page.reload();
+  await page.getByRole("button", { name: "Collapse all groups" }).click();
+  await expect(page.getByText("2 Portfolios...", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Manage groups", exact: true }).click();
+  await picker.selectOption(String(createdId));
+  await dialog.getByRole("button", { name: "Delete group", exact: true }).click();
+  await dialog.getByRole("button", { name: "Confirm delete group", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "Done", exact: true })).toBeEnabled();
+  await expect(dialog.getByRole("textbox", { name: "Group name", exact: true })).toHaveValue("");
+  expect(
+    (
+      await teacher
+        .from("gradebook_column_students")
+        .select("id,gradebook_column_id,score,score_override")
+        .eq("class_id", course.id)
+        .order("id")
+    ).data
+  ).toEqual(scoresBeforeDelete);
+  expect((await teacher.from("gradebook_columns").select("id").eq("gradebook_id", book.id)).data).toHaveLength(
+    beforeMove!.length
+  );
+  expect(
+    (await teacher.from("gradebook_columns").select("group_id").eq("id", columns![0].id).single()).data?.group_id
+  ).toBeNull();
+  await dialog.getByRole("button", { name: "Done", exact: true }).click();
+  await page.reload();
   await page.getByRole("button", { name: "Expand all groups" }).click();
   await expect(page.getByRole("columnheader", { name: /New standalone column/ })).toBeVisible();
 });

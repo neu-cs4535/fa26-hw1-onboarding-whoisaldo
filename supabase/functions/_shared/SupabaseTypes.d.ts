@@ -3587,6 +3587,7 @@ export type Database = {
           gradebook_id: number;
           id: number;
           name: string;
+          sort_order: number;
           updated_at: string;
         };
         Insert: {
@@ -3594,6 +3595,7 @@ export type Database = {
           gradebook_id: number;
           id?: number;
           name: string;
+          sort_order?: number;
           updated_at?: string;
         };
         Update: {
@@ -3601,6 +3603,7 @@ export type Database = {
           gradebook_id?: number;
           id?: number;
           name?: string;
+          sort_order?: number;
           updated_at?: string;
         };
         Relationships: [
@@ -13446,6 +13449,10 @@ export type Database = {
       github_team_slugify: { Args: { p_value: string }; Returns: string };
       gradebook_auto_layout: {
         Args: { p_gradebook_id: number };
+        Returns: undefined;
+      };
+      gradebook_column_groups_reorder: {
+        Args: { p_gradebook_id: number; p_group_ids: number[] };
         Returns: undefined;
       };
       gradebook_column_move_left: {
