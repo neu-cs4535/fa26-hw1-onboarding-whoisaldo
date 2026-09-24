@@ -871,6 +871,12 @@ test.describe("Gradebook Page - Comprehensive", () => {
     await expect(page.getByRole("button", { name: "Import Columns" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Add Column" })).toBeVisible();
 
+    // Persisted groups do not split when later fixture columns are inserted.
+    // Expand before asserting individual assessment cells.
+    const tableRegion = page.getByRole("region", { name: "Instructor Gradebook Table" });
+    await tableRegion.getByRole("button", { name: "Expand all groups" }).click();
+    await waitForVirtualizerIdle(page);
+
     // Check that Student 1's assignments are showing grades, final grade is calculated
     await expect(async () => {
       const after = await readCellNumber(page, students[0].private_profile_name, "Test Assignment 1 (Group)");
@@ -890,10 +896,7 @@ test.describe("Gradebook Page - Comprehensive", () => {
       expect(after).toBe(30);
     }).toPass({ timeout: 60_000 });
 
-    // Expand assignment groups and scroll right to reveal virtualized columns
-    const tableRegion = page.getByRole("region", { name: "Instructor Gradebook Table" });
-    await tableRegion.getByRole("button", { name: "Expand all groups" }).click();
-    await waitForVirtualizerIdle(page);
+    // Scroll right to reveal any remaining virtualized columns.
     await tableRegion.evaluate((el) => {
       el.scrollLeft = el.scrollWidth;
     });

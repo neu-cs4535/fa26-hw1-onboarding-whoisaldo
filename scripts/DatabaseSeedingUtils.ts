@@ -38,6 +38,7 @@ import {
 import {
   createClass,
   createUserInClass,
+  initializeGradebookColumnGroups,
   supabase,
   TEST_HANDOUT_REPO,
   type TestingUser
@@ -4900,6 +4901,8 @@ export class DatabaseSeeder {
     if (config.columnGroupFixtures) {
       await this.createColumnGroupFixtures(class_id, students);
     }
+
+    await initializeGradebookColumnGroups(class_id);
   }
 
   // Helper method to create specification grading scheme columns

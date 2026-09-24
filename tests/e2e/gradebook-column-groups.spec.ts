@@ -23,7 +23,15 @@
  * the generic test helpers.
  */
 import { test, expect } from "../global-setup";
-import { supabase, loginAsUser, type TestingUser } from "./TestingUtils";
+import { createClient } from "@supabase/supabase-js";
+import {
+  supabase,
+  loginAsUser,
+  createClass,
+  createUsersInClass,
+  createAuthenticatedClient,
+  type TestingUser
+} from "./TestingUtils";
 import { visualScreenshot } from "./VisualTestUtils";
 import type { Course } from "@/utils/supabase/DatabaseTypes";
 import dotenv from "dotenv";
@@ -178,4 +186,193 @@ test.describe("gradebook column groups", () => {
     // eslint-disable-next-line no-console
     console.log(`Group headers when collapsed: ${groupSummaries.join(" | ") || "(none matched by text shape)"}`);
   });
+});
+
+test("persisted groups preserve legacy boundaries and enforce course permissions", async ({ page }) => {
+  test.setTimeout(180_000);
+  await page.setViewportSize({ width: 2560, height: 1440 });
+  const course = await createClass();
+  const otherCourse = await createClass();
+  const [instructor, grader, student, outsider] = await createUsersInClass([
+    { role: "instructor", class_id: course.id },
+    { role: "grader", class_id: course.id },
+    { role: "student", class_id: course.id },
+    { role: "instructor", class_id: otherCourse.id }
+  ]);
+  const { data: books, error: bookError } = await supabase
+    .from("gradebooks")
+    .select("*")
+    .in("class_id", [course.id, otherCourse.id]);
+  expect(bookError).toBeNull();
+  const book = books!.find((b) => b.class_id === course.id)!;
+  const otherBook = books!.find((b) => b.class_id === otherCourse.id)!;
+  // Includes a sort-order gap, a repeated prefix, a two-part assignment slug,
+  // and a blank assignment subtype. These are explicit legacy expectations.
+  const layout = [
+    ["quiz-1", 0],
+    ["quiz-2", 1],
+    ["quiz-4", 3],
+    ["quiz-5", 4],
+    ["assignment-lab-1", 5],
+    ["assignment-lab-2", 6],
+    ["assignment-final", 7],
+    ["quiz-6", 8],
+    ["assignment--1", 9]
+  ] as const;
+  for (const [slug, sort_order] of layout) {
+    const { error } = await supabase.from("gradebook_columns").insert({
+      class_id: course.id,
+      gradebook_id: book.id,
+      name: slug,
+      slug,
+      sort_order,
+      max_score: 10
+    });
+    expect(error).toBeNull();
+  }
+  expect(
+    (
+      await supabase.from("gradebook_columns").insert({
+        class_id: otherCourse.id,
+        gradebook_id: otherBook.id,
+        name: "Other quiz",
+        slug: "quiz-1",
+        max_score: 10
+      })
+    ).error
+  ).toBeNull();
+  for (const id of [book.id, otherBook.id, book.id]) {
+    expect((await supabase.rpc("initialize_gradebook_column_groups", { target_gradebook_id: id })).error).toBeNull();
+  }
+  const { data: columns, error } = await supabase
+    .from("gradebook_columns")
+    .select("id, group_id, gradebook_column_groups(name)")
+    .eq("gradebook_id", book.id)
+    .order("sort_order");
+  expect(error).toBeNull();
+  expect(columns!.map((c) => c.gradebook_column_groups?.name)).toEqual([
+    "Quiz",
+    "Quiz",
+    "Quiz",
+    "Quiz",
+    "Lab",
+    "Lab",
+    "Assignment",
+    "Quiz",
+    ""
+  ]);
+  expect(columns![0].group_id).toBe(columns![1].group_id);
+  expect(columns![2].group_id).toBe(columns![3].group_id);
+  expect(new Set(columns!.map((c) => c.group_id)).size).toBe(6);
+  const groupId = columns![0].group_id!;
+  const { data: foreignGroups } = await supabase
+    .from("gradebook_column_groups")
+    .select("id")
+    .eq("gradebook_id", otherBook.id);
+  const foreignGroupId = foreignGroups![0].id;
+  const clients = await Promise.all([instructor, grader, student, outsider].map(createAuthenticatedClient));
+  const [teacher, staff, learner, stranger] = clients;
+  const anonymous = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_ANON_KEY!, {
+    auth: { persistSession: false, autoRefreshToken: false }
+  });
+  expect((await anonymous.from("gradebook_column_groups").select("id").eq("gradebook_id", book.id)).data).toEqual([]);
+
+  for (const client of clients.slice(0, 3)) {
+    const { data, error: readError } = await client
+      .from("gradebook_column_groups")
+      .select("id")
+      .eq("gradebook_id", book.id);
+    expect(readError).toBeNull();
+    expect(data).toHaveLength(6);
+    expect(
+      (await client.rpc("initialize_gradebook_column_groups", { target_gradebook_id: book.id })).error
+    ).not.toBeNull();
+  }
+  expect((await stranger.from("gradebook_column_groups").select("id").eq("gradebook_id", book.id)).data).toEqual([]);
+  for (const client of clients.slice(1)) {
+    expect(
+      (
+        await client.from("gradebook_column_groups").insert({
+          class_id: course.id,
+          gradebook_id: book.id,
+          name: "Forbidden"
+        })
+      ).error
+    ).not.toBeNull();
+    expect(
+      (await client.from("gradebook_column_groups").update({ name: "Forbidden" }).eq("id", groupId).select("id")).data
+    ).toEqual([]);
+    expect((await client.from("gradebook_column_groups").delete().eq("id", groupId).select("id")).data).toEqual([]);
+  }
+  const { data: hiddenGroup, error: createError } = await teacher
+    .from("gradebook_column_groups")
+    .insert({
+      class_id: course.id,
+      gradebook_id: book.id,
+      name: "Staff-only topic"
+    })
+    .select("id")
+    .single();
+  expect(createError).toBeNull();
+  const { data: hiddenColumn, error: hiddenError } = await teacher
+    .from("gradebook_columns")
+    .insert({
+      class_id: course.id,
+      gradebook_id: book.id,
+      group_id: hiddenGroup!.id,
+      name: "Private assessment",
+      slug: "private",
+      instructor_only: true,
+      max_score: 10
+    })
+    .select("id")
+    .single();
+  expect(hiddenError).toBeNull();
+  expect((await learner.from("gradebook_column_groups").select("id").eq("id", hiddenGroup!.id)).data).toEqual([]);
+  expect((await staff.from("gradebook_column_groups").select("id").eq("id", hiddenGroup!.id)).data).toHaveLength(1);
+  expect((await teacher.from("gradebook_column_groups").delete().eq("id", hiddenGroup!.id)).error).toBeNull();
+  expect(
+    (await teacher.from("gradebook_columns").select("group_id").eq("id", hiddenColumn!.id).single()).data?.group_id
+  ).toBeNull();
+  // Even the service role cannot create inconsistent course/gradebook membership.
+  expect(
+    (
+      await supabase.from("gradebook_column_groups").insert({
+        class_id: course.id,
+        gradebook_id: otherBook.id,
+        name: "Wrong course"
+      })
+    ).error?.code
+  ).toBe("23503");
+  expect(
+    (await teacher.from("gradebook_columns").update({ group_id: foreignGroupId }).eq("id", columns![0].id)).error?.code
+  ).toBe("23503");
+  expect(
+    (await teacher.from("gradebook_column_groups").update({ name: "Persisted topic" }).eq("id", groupId)).error
+  ).toBeNull();
+  expect(
+    (await teacher.from("gradebook_columns").update({ name: "Renamed quiz" }).eq("id", columns![0].id)).error
+  ).toBeNull();
+  expect((await supabase.rpc("initialize_gradebook_column_groups", { target_gradebook_id: book.id })).error).toBeNull();
+  expect(
+    (await teacher.from("gradebook_columns").select("group_id").eq("id", columns![0].id).single()).data?.group_id
+  ).toBe(groupId);
+  expect(
+    (
+      await teacher.from("gradebook_columns").insert({
+        class_id: course.id,
+        gradebook_id: book.id,
+        name: "New standalone column",
+        slug: "quiz-new",
+        max_score: 10
+      })
+    ).error
+  ).toBeNull();
+  await loginAsUser(page, instructor, course);
+  await page.goto(`/course/${course.id}/manage/gradebook`);
+  await expect(page.getByRole("button", { name: "Expand all groups" })).toBeVisible();
+  await page.getByRole("button", { name: "Collapse all groups" }).click();
+  await expect(page.getByText("2 Persisted topics...", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Expand all groups" }).click();
+  await expect(page.getByRole("columnheader", { name: /New standalone column/ })).toBeVisible();
 });

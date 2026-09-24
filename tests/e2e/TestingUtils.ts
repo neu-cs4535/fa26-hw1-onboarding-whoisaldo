@@ -2671,6 +2671,18 @@ export async function gradeSubmission(
   return reviewResult;
 }
 
+/** Import the completed legacy fixtures into persisted groups, as the migration does. */
+export async function initializeGradebookColumnGroups(class_id: number) {
+  const { data: gradebooks, error } = await supabase.from("gradebooks").select("id").eq("class_id", class_id);
+  if (error) throw error;
+  for (const gradebook of gradebooks ?? []) {
+    const { error: groupError } = await supabase.rpc("initialize_gradebook_column_groups", {
+      target_gradebook_id: gradebook.id
+    });
+    if (groupError) throw groupError;
+  }
+}
+
 /**
  * Creates assignments and gradebook columns for testing purposes
  * @param options Configuration options for creating assignments and gradebook columns
@@ -3513,6 +3525,8 @@ export async function createAssignmentsAndGradebookColumns({
       });
     }
   }
+
+  await initializeGradebookColumnGroups(class_id);
 
   return {
     assignments,
