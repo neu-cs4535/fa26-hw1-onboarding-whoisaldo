@@ -40,6 +40,8 @@ I would ask the CS 2100 coordinator how retakes, missing attempts, excused work 
 
 ## Migration and permissions
 
+- Auto-layout updates column order and group order in one transaction. It applies the existing column layout, then places each group at its first member's new position. Empty groups follow populated groups in their previous relative order. Membership remains unchanged, and unassigned columns still appear after groups.
+- Dragging an expanded column to either edge of its group reorders only that group's members, even when the stored global column order interleaves multiple groups. Drops inside a different group still require an explicit membership edit.
 - The migration imports every existing gradebook in `(coalesce(sort_order, 0), id)` order. IDs break ties deterministically where the old client did not specify an order.
 - Existing rows with inconsistent course/gradebook ownership cause the transaction to fail rather than silently reassigning grades.
 - Numeric families retain membership across gaps and interleaving. Each group starts at its first member's order; instructor reordering replaces group positions atomically and never updates `group_id`. Empty and duplicate-name groups have distinct IDs and independent order/collapse state.
@@ -49,7 +51,7 @@ I would ask the CS 2100 coordinator how retakes, missing attempts, excused work 
 
 ## Verification
 
-The existing grading screenshot test captures expanded and collapsed headers of the seeded CS4535 course. The additional integration test covers the three backfill fixes, repeated imports, names surviving a column rename, unassigned columns, instructor/grader/student permissions, cross-course foreign keys, invalid reorder payloads, and unchanged memberships under both reorder APIs. Its browser workflow creates and renames a group, assigns columns from another group and from the unassigned state, reorders it, reloads, then deletes it and checks that the columns survive. It runs in the existing gradebook CI job, without relaxing that job's assertions.
+The existing grading screenshot test captures expanded and collapsed headers of the seeded CS4535 course. The additional integration test covers the three backfill fixes, repeated imports, names surviving a column rename, unassigned columns, instructor/grader/student permissions, cross-course foreign keys, invalid reorder payloads, and unchanged memberships under both reorder APIs. Its browser workflow creates and renames a group, assigns columns from another group and from the unassigned state, reorders it, reloads, then deletes it and checks that the columns survive. Two ordering regressions exercise real pointer drags at both group boundaries with interleaved stored column order, and Auto-layout through the instructor UI. They check the displayed order, database order, unchanged membership, permissions and persistence after reload. They run in the existing gradebook CI job, without relaxing that job's assertions.
 
 Run the same checks as CI:
 
@@ -76,4 +78,4 @@ Maintain current audit partitions with `SELECT public.audit_maintain_partitions(
 
 ## Rollback
 
-Deploy the previous frontend first, then run `tests/manual/gradebook_column_groups_down.sql` against the intended database. The script is transactional and removes the new helper, membership column, group table and ownership constraint. Columns, expressions, ordering and scores are not removed. Back up the group table and `(id, group_id)` mappings first if instructors have edited groups: those labels and memberships cannot be recovered from slugs after rollback. For another rollout, apply a new forward migration rather than rewriting production migration history.
+Deploy the previous frontend first, then run `tests/manual/gradebook_column_groups_down.sql` against the intended database. The script is transactional, restores the previous Auto-layout function, and removes the new helper, membership column, group table and ownership constraint. Columns, expressions, ordering and scores are not removed. Back up the group table and `(id, group_id)` mappings first if instructors have edited groups: those labels and memberships cannot be recovered from slugs after rollback. For another rollout, apply a new forward migration rather than rewriting production migration history.

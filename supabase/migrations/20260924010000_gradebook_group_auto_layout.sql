@@ -1,9 +1,5 @@
--- Restore the old frontend before rolling back the schema. Group labels and
--- membership are discarded, but columns, sort orders, expressions and scores remain.
-BEGIN;
--- Restore the previous RPC before removing the group table it now reads.
--- Auto-layout RPC to reorganize gradebook columns with topological sorting
--- First sorts alphabetically by slug, then respects gradebook_column dependencies
+-- Auto-layout persists the displayed group order as well as member order.
+-- Group membership is unchanged; both orders commit in the same transaction.
 
 CREATE OR REPLACE FUNCTION public.gradebook_auto_layout(p_gradebook_id bigint)
 RETURNS void
@@ -31,13 +27,14 @@ BEGIN
   END IF;
 
   -- Check if user is authorized as class instructor
-  IF NOT public.authorizeforclassinstructor(v_class_id) THEN
-    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_class_id;
+  IF auth.uid() IS NULL OR NOT coalesce(public.authorizeforclassinstructor(v_class_id), false) THEN
+    RAISE EXCEPTION 'insufficient permissions: instructor access required for class %', v_class_id
+      USING ERRCODE = '42501';
   END IF;
 
   -- Serialize per-gradebook to avoid race conditions
-  -- Namespace 17031 chosen arbitrarily for "gradebook_auto_layout"
-  PERFORM pg_advisory_xact_lock(17031, p_gradebook_id);
+  -- Match the bigint lock used by manual column and group reorder.
+  PERFORM pg_advisory_xact_lock(p_gradebook_id);
   -- Temporarily bypass the sort order trigger for this specific gradebook during bulk operations
   -- This avoids ACCESS EXCLUSIVE locks that would block concurrent operations on other gradebooks
   PERFORM set_config('pawtograder.bypass_sort_order_trigger_' || p_gradebook_id::text, 'true', true);
@@ -156,6 +153,20 @@ BEGIN
     FROM ordered_final of
     WHERE gc.id = of.id;
 
+    -- Each group takes its first member's new position, as in the backfill.
+    -- Empty groups follow populated groups and retain their relative order.
+    WITH ordered_groups AS (
+        SELECT g.id, row_number() OVER (
+            ORDER BY min(c.sort_order) NULLS LAST, g.sort_order, g.id
+        ) - 1 AS position
+        FROM public.gradebook_column_groups g
+        LEFT JOIN public.gradebook_columns c ON c.group_id = g.id
+        WHERE g.gradebook_id = p_gradebook_id
+        GROUP BY g.id, g.sort_order
+    )
+    UPDATE public.gradebook_column_groups g SET sort_order = ordered_groups.position
+        FROM ordered_groups WHERE g.id = ordered_groups.id;
+
   EXCEPTION
     WHEN OTHERS THEN
       -- Always reset the bypass setting for this gradebook, even if there was an error
@@ -169,12 +180,5 @@ BEGIN
 END;
 $$;
 
-grant execute on function public.gradebook_auto_layout(bigint) to "anon", "authenticated", "service_role";
-
-DROP FUNCTION public.gradebook_column_groups_reorder(bigint, bigint[]);
-DROP FUNCTION public.initialize_gradebook_column_groups(bigint);
-DROP POLICY "class members read groups" ON public.gradebook_column_groups;
-ALTER TABLE public.gradebook_columns DROP COLUMN group_id;
-DROP TABLE public.gradebook_column_groups;
-ALTER TABLE public.gradebooks DROP CONSTRAINT gradebooks_id_class_unique;
-COMMIT;
+REVOKE ALL ON FUNCTION public.gradebook_auto_layout(bigint) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.gradebook_auto_layout(bigint) TO authenticated, service_role;

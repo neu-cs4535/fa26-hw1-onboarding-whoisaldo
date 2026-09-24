@@ -2176,6 +2176,7 @@ function GradebookGapDropTarget({
   return (
     <Box
       ref={setNodeRef}
+      data-gradebook-gap-index={gapIndex}
       position="absolute"
       left={`${boundaryLeftPx - hitW / 2}px`}
       top={0}
@@ -2648,10 +2649,14 @@ export default function GradebookTable() {
       });
 
       if (error) throw error;
+      await Promise.all([
+        gradebookController.gradebook_columns.refetchAll(),
+        gradebookController.gradebook_column_groups.refetchAll()
+      ]);
 
       toaster.create({
         title: "Auto-layout complete",
-        description: "Successfully reorganized gradebook columns",
+        description: "Successfully reorganized gradebook groups and columns",
         type: "success"
       });
     } catch (error) {
@@ -3026,13 +3031,15 @@ export default function GradebookTable() {
       const groupIds = [...columnGroups].sort((a, b) => a.sort_order - b.sort_order || a.id - b.id).map((g) => g.id);
       const targetUnit = visibleReorderUnits[gapIndex] ?? visibleReorderUnits.at(-1);
       const target = gradebookColumns.find((c) => c.id === targetUnit?.[0]);
+      const previousUnit = visibleReorderUnits[gapIndex - 1];
+      const previous = gradebookColumns.find((c) => c.id === previousUnit?.[0]);
       const movingGroup = dragged.group_id !== null && collapsedGroups.has(`group-${dragged.group_id}`);
       if (movingGroup && target?.group_id === dragged.group_id) return;
-      if (!movingGroup && target && target.group_id !== dragged.group_id) {
+      // A gap between groups is also the end of the group on its left.
+      if (!movingGroup && target?.group_id !== dragged.group_id && previous?.group_id !== dragged.group_id) {
         toaster.create({ title: "Use Manage groups to change a column's group", type: "info" });
         return;
       }
-      const merged = insertColumnAtGap(fullGradeColumnIdsOrdered, draggedColumnId, visibleReorderUnits, gapIndex);
       setIsReorderingColumns(true);
       try {
         if (movingGroup) {
@@ -3050,6 +3057,22 @@ export default function GradebookTable() {
           if (error) throw error;
           await gradebookController.gradebook_column_groups.refetchAll();
         } else {
+          // Displayed group order can differ from global column sort_order.
+          // Reorder the group's members in their existing slots so a boundary
+          // drop never uses another group's column as a database-order anchor.
+          const memberIds = new Set(gradebookColumns.filter((c) => c.group_id === dragged.group_id).map((c) => c.id));
+          const memberUnits = visibleReorderUnits.filter((unit) => memberIds.has(unit[0]));
+          const memberGapIndex = visibleReorderUnits.slice(0, gapIndex).filter((unit) => memberIds.has(unit[0])).length;
+          const reorderedMembers = insertColumnAtGap(
+            fullGradeColumnIdsOrdered.filter((id) => memberIds.has(id)),
+            draggedColumnId,
+            memberUnits,
+            memberGapIndex
+          );
+          let memberIndex = 0;
+          const merged = fullGradeColumnIdsOrdered.map((id) =>
+            memberIds.has(id) ? reorderedMembers[memberIndex++] : id
+          );
           const { error } = await supabaseForGradebook.rpc("gradebook_columns_reorder", {
             p_ordered_column_ids: merged
           });

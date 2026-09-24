@@ -35,6 +35,7 @@ import {
 import { visualScreenshot } from "./VisualTestUtils";
 import type { Course } from "@/utils/supabase/DatabaseTypes";
 import dotenv from "dotenv";
+import type { Page } from "@playwright/test";
 
 dotenv.config({ path: ".env.local", quiet: true });
 
@@ -487,4 +488,157 @@ test("groups fix backfill families and enforce course permissions", async ({ pag
   await page.reload();
   await page.getByRole("button", { name: "Expand all groups" }).click();
   await expect(page.getByRole("columnheader", { name: /New standalone column/ })).toBeVisible();
+});
+
+async function createGroupOrderingFixture() {
+  const course = await createClass();
+  const [instructor, student, grader] = await createUsersInClass([
+    { role: "instructor", class_id: course.id },
+    { role: "student", class_id: course.id },
+    { role: "grader", class_id: course.id }
+  ]);
+  const teacher = await createAuthenticatedClient(instructor);
+  const { data: book, error: bookError } = await teacher
+    .from("gradebooks")
+    .select("id")
+    .eq("class_id", course.id)
+    .single();
+  expect(bookError).toBeNull();
+  const { data: groups, error: groupError } = await teacher
+    .from("gradebook_column_groups")
+    .insert(
+      ["Beta", "Empty first", "Alpha", "Empty second"].map((name, sort_order) => ({
+        gradebook_id: book!.id,
+        class_id: course.id,
+        name,
+        sort_order
+      }))
+    )
+    .select("*");
+  expect(groupError).toBeNull();
+  const alpha = groups!.find((g) => g.name === "Alpha")!;
+  const beta = groups!.find((g) => g.name === "Beta")!;
+  const columns = [];
+  // Interleave the database order while groups display as Beta then Alpha.
+  for (const [name, slug, group_id] of [
+    ["Alpha 1", "alpha-1", alpha.id],
+    ["Beta 1", "beta-1", beta.id],
+    ["Alpha 2", "alpha-2", alpha.id],
+    ["Beta 2", "beta-2", beta.id]
+  ] as const) {
+    const { data: column, error } = await teacher
+      .from("gradebook_columns")
+      .insert({
+        gradebook_id: book!.id,
+        class_id: course.id,
+        name,
+        slug,
+        group_id,
+        sort_order: columns.length,
+        max_score: 10
+      })
+      .select("id,group_id,name")
+      .single();
+    expect(error).toBeNull();
+    columns.push(column!);
+  }
+  return { course, instructor, student, grader, teacher, book: book!, groups: groups!, columns };
+}
+
+async function dragColumnToGap(page: Page, columnId: number, gapIndex: number) {
+  const handle = page
+    .locator(`[data-col-id="grade_${columnId}"]`)
+    .getByRole("button", { name: "Drag to reorder column" });
+  await expect(handle).toBeVisible();
+  const source = (await handle.boundingBox())!;
+  await page.mouse.move(source.x + source.width / 2, source.y + source.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(source.x + source.width / 2 + 12, source.y + source.height / 2, { steps: 4 });
+  const gap = page.locator(`[data-gradebook-gap-index="${gapIndex}"]`);
+  await expect(gap).toBeVisible();
+  const target = (await gap.boundingBox())!;
+  await page.mouse.move(target.x + target.width / 2, target.y + target.height / 2, { steps: 15 });
+  await page.mouse.up();
+}
+
+test("column dragging handles both group boundaries with interleaved stored order", async ({ page }) => {
+  test.setTimeout(180_000);
+  const { course, instructor, teacher, book, columns } = await createGroupOrderingFixture();
+  const [a1, b1, a2, b2] = columns;
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await loginAsUser(page, instructor, course);
+  await page.goto(`/course/${course.id}/manage/gradebook`);
+  await page.getByRole("button", { name: "Expand all groups" }).click();
+  const headers = page.getByRole("region", { name: "Instructor Gradebook Table" }).locator('[data-col-id^="grade_"]');
+  const headerIds = () =>
+    headers.evaluateAll((els) => els.map((el) => Number(el.getAttribute("data-col-id")!.slice(6))));
+  const storedOrder = async () => {
+    const { data, error } = await teacher
+      .from("gradebook_columns")
+      .select("id,group_id")
+      .eq("gradebook_id", book.id)
+      .order("sort_order");
+    expect(error).toBeNull();
+    return data!;
+  };
+  await expect.poll(headerIds).toEqual([b1.id, b2.id, a1.id, a2.id]);
+
+  // The gap after Beta 2 is also the gap before Alpha 1.
+  await dragColumnToGap(page, b1.id, 2);
+  await expect.poll(headerIds).toEqual([b2.id, b1.id, a1.id, a2.id]);
+  expect(await storedOrder()).toEqual([a1, b2, a2, b1].map(({ id, group_id }) => ({ id, group_id })));
+
+  await dragColumnToGap(page, b1.id, 0);
+  await expect.poll(headerIds).toEqual([b1.id, b2.id, a1.id, a2.id]);
+  const beforeInvalidDrop = await storedOrder();
+  // An interior gap in Alpha is still rejected instead of changing membership.
+  await dragColumnToGap(page, b1.id, 3);
+  // The shared visual-test CSS hides toasts, so assert their DOM presence.
+  await expect(page.getByText("Use Manage groups to change a column's group", { exact: true })).toBeAttached();
+  expect(await storedOrder()).toEqual(beforeInvalidDrop);
+  await page.reload();
+  await page.getByRole("button", { name: "Expand all groups" }).click();
+  await expect.poll(headerIds).toEqual([b1.id, b2.id, a1.id, a2.id]);
+});
+
+test("auto-layout orders persisted groups and members without changing membership", async ({ page }) => {
+  test.setTimeout(180_000);
+  const { course, instructor, student, grader, teacher, book, columns } = await createGroupOrderingFixture();
+  const [a1, b1, a2, b2] = columns;
+  for (const user of [student, grader]) {
+    const client = await createAuthenticatedClient(user);
+    expect((await client.rpc("gradebook_auto_layout", { p_gradebook_id: book.id })).error?.code).toBe("42501");
+  }
+  const otherCourse = await createClass();
+  const [outsider] = await createUsersInClass([{ role: "instructor", class_id: otherCourse.id }]);
+  const stranger = await createAuthenticatedClient(outsider);
+  expect((await stranger.rpc("gradebook_auto_layout", { p_gradebook_id: book.id })).error?.code).toBe("42501");
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await loginAsUser(page, instructor, course);
+  await page.goto(`/course/${course.id}/manage/gradebook`);
+  await page.getByRole("button", { name: "Expand all groups" }).click();
+  const headers = page.getByRole("region", { name: "Instructor Gradebook Table" }).locator('[data-col-id^="grade_"]');
+  const headerIds = () =>
+    headers.evaluateAll((els) => els.map((el) => Number(el.getAttribute("data-col-id")!.slice(6))));
+  await expect.poll(headerIds).toEqual([b1.id, b2.id, a1.id, a2.id]);
+  await page.getByRole("button", { name: "Auto-layout columns", exact: true }).click();
+  await expect(page.getByText("Auto-layout complete", { exact: true })).toBeAttached();
+  await expect.poll(headerIds).toEqual([a1.id, a2.id, b1.id, b2.id]);
+  const { data: orderedGroups, error: groupError } = await teacher
+    .from("gradebook_column_groups")
+    .select("name")
+    .eq("gradebook_id", book.id)
+    .order("sort_order");
+  expect(groupError).toBeNull();
+  expect(orderedGroups!.map((g) => g.name)).toEqual(["Alpha", "Beta", "Empty first", "Empty second"]);
+  const { data: members, error: memberError } = await teacher
+    .from("gradebook_columns")
+    .select("id,group_id")
+    .eq("gradebook_id", book.id)
+    .order("sort_order");
+  expect(memberError).toBeNull();
+  expect(members).toEqual([a1, a2, b1, b2].map(({ id, group_id }) => ({ id, group_id })));
+  await page.reload();
+  await page.getByRole("button", { name: "Expand all groups" }).click();
+  await expect.poll(headerIds).toEqual([a1.id, a2.id, b1.id, b2.id]);
 });
